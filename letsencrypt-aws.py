@@ -131,7 +131,7 @@ class Route53ChallengeCompleter(object):
                 if (
                     domain.endswith(zone["Name"]) or
                     (domain + ".").endswith(zone["Name"])
-                ):
+                ) and not zone["Config"]["PrivateZone"]:
                     zones.append((zone["Name"], zone["Id"]))
 
         if not zones:
@@ -339,9 +339,18 @@ def update_elb(logger, acme_client, force_issue, cert_request):
     days_until_expiration = (
         current_cert.not_valid_after - datetime.datetime.today()
     )
-    current_domains = current_cert.extensions.get_extension_for_class(
-        x509.SubjectAlternativeName
-    ).value.get_values_for_type(x509.DNSName)
+
+    try:
+        san_extension = current_cert.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName
+        )
+    except x509.ExtensionNotFound:
+        # Handle the case where an old certificate doesn't have a SAN extension
+        # and always reissue in that case.
+        current_domains = []
+    else:
+        current_domains = san_extension.value.get_values_for_type(x509.DNSName)
+
     if (
         days_until_expiration > CERTIFICATE_EXPIRATION_THRESHOLD and
         # If the set of hosts we want for our certificate changes, we update
@@ -413,7 +422,13 @@ def update_elbs(logger, acme_client, force_issue, certificate_requests):
 def setup_acme_client(s3_client, acme_directory_url, acme_account_key):
     uri = rfc3986.urlparse(acme_account_key)
     if uri.scheme == "file":
-        with open(uri.path) as f:
+        if uri.host is None:
+            path = uri.path
+        elif uri.path is None:
+            path = uri.host
+        else:
+            path = os.path.join(uri.host, uri.path)
+        with open(path) as f:
             key = f.read()
     elif uri.scheme == "s3":
         # uri.path includes a leading "/"
