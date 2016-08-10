@@ -35,13 +35,28 @@ class Logger(object):
 
     def emit(self, event, **data):
         formatted_data = " ".join(
-            "{}={!r}".format(k, v) for k, v in data.iteritems()
+            "{}={!r}".format(k, v) for k, v in data.items()
         )
         self._out.write("{} [{}] {}\n".format(
             datetime.datetime.utcnow().replace(microsecond=0),
             event,
             formatted_data
         ))
+
+
+def _get_iam_certificate(iam_client, certificate_id):
+    paginator = iam_client.get_paginator("list_server_certificates")
+    for page in paginator.paginate():
+        for server_certificate in page["ServerCertificateMetadataList"]:
+            if server_certificate["Arn"] == certificate_id:
+                cert_name = server_certificate["ServerCertificateName"]
+                response = iam_client.get_server_certificate(
+                    ServerCertificateName=cert_name,
+                )
+                return x509.load_pem_x509_certificate(
+                    response["ServerCertificate"]["CertificateBody"],
+                    default_backend(),
+                )
 
 
 class CertificateRequest(object):
@@ -66,24 +81,20 @@ class ELBCertificate(object):
             LoadBalancerNames=[self.elb_name]
         )
         [description] = response["LoadBalancerDescriptions"]
-        [certificate_id] = [
-            listener["Listener"]["SSLCertificateId"]
+        [elb_listener] = [
+            listener["Listener"]
             for listener in description["ListenerDescriptions"]
             if listener["Listener"]["LoadBalancerPort"] == self.elb_port
         ]
 
-        paginator = self.iam_client.get_paginator("list_server_certificates")
-        for page in paginator.paginate():
-            for server_certificate in page["ServerCertificateMetadataList"]:
-                if server_certificate["Arn"] == certificate_id:
-                    cert_name = server_certificate["ServerCertificateName"]
-                    response = self.iam_client.get_server_certificate(
-                        ServerCertificateName=cert_name,
-                    )
-                    return x509.load_pem_x509_certificate(
-                        response["ServerCertificate"]["CertificateBody"],
-                        default_backend(),
-                    )
+        if "SSLCertificateId" not in elb_listener:
+            raise ValueError(
+                "A certificate must already be configured for the ELB"
+            )
+
+        return _get_iam_certificate(
+            self.iam_client, elb_listener["SSLCertificateId"]
+        )
 
     def update_certificate(self, logger, hosts, private_key, pem_certificate,
                            pem_certificate_chain):
@@ -327,38 +338,41 @@ def request_certificate(logger, acme_client, elb_name, authorizations, csr):
     return pem_certificate, pem_certificate_chain
 
 
-def update_elb(logger, acme_client, force_issue, cert_request):
+def update_cert(logger, acme_client, force_issue, cert_request):
     logger.emit("updating-elb", elb_name=cert_request.cert_location.elb_name)
 
     current_cert = cert_request.cert_location.get_current_certificate()
-    logger.emit(
-        "updating-elb.certificate-expiration",
-        elb_name=cert_request.cert_location.elb_name,
-        expiration_date=current_cert.not_valid_after
-    )
-    days_until_expiration = (
-        current_cert.not_valid_after - datetime.datetime.today()
-    )
-
-    try:
-        san_extension = current_cert.extensions.get_extension_for_class(
-            x509.SubjectAlternativeName
+    if current_cert is not None:
+        logger.emit(
+            "updating-elb.certificate-expiration",
+            elb_name=cert_request.cert_location.elb_name,
+            expiration_date=current_cert.not_valid_after
         )
-    except x509.ExtensionNotFound:
-        # Handle the case where an old certificate doesn't have a SAN extension
-        # and always reissue in that case.
-        current_domains = []
-    else:
-        current_domains = san_extension.value.get_values_for_type(x509.DNSName)
+        days_until_expiration = (
+            current_cert.not_valid_after - datetime.datetime.today()
+        )
 
-    if (
-        days_until_expiration > CERTIFICATE_EXPIRATION_THRESHOLD and
-        # If the set of hosts we want for our certificate changes, we update
-        # even if the current certificate isn't expired.
-        sorted(current_domains) == sorted(cert_request.hosts) and
-        not force_issue
-    ):
-        return
+        try:
+            san_extension = current_cert.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            )
+        except x509.ExtensionNotFound:
+            # Handle the case where an old certificate doesn't have a SAN
+            # extension and always reissue in that case.
+            current_domains = []
+        else:
+            current_domains = san_extension.value.get_values_for_type(
+                x509.DNSName
+            )
+
+        if (
+            days_until_expiration > CERTIFICATE_EXPIRATION_THRESHOLD and
+            # If the set of hosts we want for our certificate changes, we
+            # update even if the current certificate isn't expired.
+            sorted(current_domains) == sorted(cert_request.hosts) and
+            not force_issue
+        ):
+            return
 
     if cert_request.key_type == "rsa":
         private_key = generate_rsa_private_key()
@@ -409,9 +423,9 @@ def update_elb(logger, acme_client, force_issue, cert_request):
             )
 
 
-def update_elbs(logger, acme_client, force_issue, certificate_requests):
+def update_certs(logger, acme_client, force_issue, certificate_requests):
     for cert_request in certificate_requests:
-        update_elb(
+        update_cert(
             logger,
             acme_client,
             force_issue,
@@ -440,7 +454,7 @@ def setup_acme_client(s3_client, acme_directory_url, acme_account_key):
         )
 
     key = serialization.load_pem_private_key(
-        key, password=None, backend=default_backend()
+        key.encode("utf-8"), password=None, backend=default_backend()
     )
     return acme_client_for_private_key(acme_directory_url, key)
 
@@ -512,7 +526,7 @@ def update_certificates(persistent=False, force_issue=False):
     if persistent:
         logger.emit("running", mode="persistent")
         while True:
-            update_elbs(
+            update_certs(
                 logger, acme_client,
                 force_issue, certificate_requests
             )
@@ -521,7 +535,7 @@ def update_certificates(persistent=False, force_issue=False):
             time.sleep(PERSISTENT_SLEEP_INTERVAL)
     else:
         logger.emit("running", mode="single")
-        update_elbs(
+        update_certs(
             logger, acme_client,
             force_issue, certificate_requests
         )
